@@ -16,7 +16,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_root))
 
     from data import CausalDataset, generate_synthetic
-    from model import DragonNetContinuous
+    from model import DragonNetContinuousAdvanced
     from utils import get_device, set_seed
 
     try:
@@ -25,7 +25,7 @@ if __package__ in (None, ""):
         DragonNetContinuousAdvanced = None
 else:
     from .data import CausalDataset, generate_synthetic
-    from .model import DragonNetContinuous
+    from .model import DragonNetContinuousAdvanced
     from .utils import get_device, set_seed
 
     try:
