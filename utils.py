@@ -10,10 +10,15 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def get_device(cfg_device: str) -> torch.device:
-    if cfg_device == "cuda" and torch.cuda.is_available():
+def get_device(name: str) -> torch.device:
+    if name == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
+def batch_to_device(batch: dict, device: torch.device) -> dict:
+    return {k: v.to(device) for k, v in batch.items()}
+
 def save_checkpoint(path: str, state: dict):
+    import os
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(state, path)
