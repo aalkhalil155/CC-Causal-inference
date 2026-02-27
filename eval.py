@@ -2,6 +2,7 @@ import argparse
 import yaml
 import numpy as np
 import torch
+import os
 from torch.utils.data import DataLoader
 
 import matplotlib.pyplot as plt
