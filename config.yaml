@@ -1,0 +1,30 @@
+seed: 42
+device: "cuda"
+
+data:
+  n_train: 50000
+  n_valid: 10000
+  n_num: 12
+  cat_cardinalities: [8, 12, 6]
+  treatment_noise: 0.25
+  outcome_noise: 0.0
+
+train:
+  batch_size: 1024
+  epochs: 10
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 5.0
+
+model:
+  d_hidden: 128
+  n_shared_layers: 3
+  dropout: 0.1
+  emb_dim: 8
+  min_sigma: 0.05
+
+loss:
+  w_outcome: 1.0
+  w_gps: 1.0
+  w_target_reg: 0.1
+  w_mono: 0.0
