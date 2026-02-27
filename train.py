@@ -5,37 +5,6 @@ import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-from .utils import set_seed, get_device, batch_to_device, save_checkpoint
-from .data import generate_synthetic, CausalDataset
-from .preprocess import Standardizer
-from .model import DragonNetContinuousAdvanced
-from .losses import (
-    outcome_bce_logits,
-    gps_gaussian_nll,
-    targeted_regularized_logits,
-    epsilon_penalty,
-    monotonicity_penalty,
-)
-
-@torch.no_grad()
-def evaluate(model, loader, device, epsilon):
-    model.eval()
-    losses = []
-    accs = []
-    for batch in loader:
-        batch = batch_to_device(batch, device)
-        out = model(batch["x_num"], batch["x_cat"], batch["t"])
-
-        logits_t = targeted_regularized_logits(out["logits"], batch["t"], out["mu"], out["sigma"], epsilon)
-
-        loss_y = outcome_bce_logits(batch["y"], logits_t)
-        loss_g = gps_gaussian_nll(batch["t"], out["mu"], out["sigma"])
-        losses.append((loss_y + loss_g).item())
-
-        pred = (torch.sigmoid(out["logits"]) > 0.5).float()
-        accs.append((pred == batch["y"]).float().mean().item())
 
 # Support both execution modes:
 # 1) `python train.py` (script mode)
@@ -75,9 +44,10 @@ def main():
     cfg = load_config()
 
     set_seed(cfg["seed"])
-    device = get_device(cfg.get("device", "cpu"))
+    device = get_device(cfg["device"])
 
     dcfg = cfg["data"]
+
     x_num_tr, x_cat_tr, t_tr, y_tr = generate_synthetic(
         n=dcfg["n_train"],
         n_num=dcfg["n_num"],
@@ -87,18 +57,6 @@ def main():
         seed=cfg["seed"],
     )
 
-    pcfg = cfg.get("preprocess", {})
-    x_scaler = Standardizer().fit(x_num_tr) if pcfg.get("standardize_numeric", True) else None
-    t_scaler = Standardizer().fit(t_tr.reshape(-1, 1)) if pcfg.get("standardize_treatment", True) else None
-
-    if x_scaler is not None:
-        x_num_tr = x_scaler.transform(x_num_tr).astype(np.float32)
-        x_num_va = x_scaler.transform(x_num_va).astype(np.float32)
-
-    if t_scaler is not None:
-        t_tr = t_scaler.transform(t_tr.reshape(-1, 1)).reshape(-1).astype(np.float32)
-        t_va = t_scaler.transform(t_va.reshape(-1, 1)).reshape(-1).astype(np.float32)
-
     train_ds = CausalDataset(x_num_tr, x_cat_tr, t_tr, y_tr)
     train_loader = DataLoader(
         train_ds,
@@ -106,8 +64,7 @@ def main():
         shuffle=True,
     )
 
-    mcfg = cfg["model"]
-    model = DragonNetContinuousAdvanced(
+    model = DragonNetContinuous(
         n_num=dcfg["n_num"],
         cat_cardinalities=dcfg["cat_cardinalities"],
         emb_dim=cfg["model"]["emb_dim"],
@@ -124,65 +81,20 @@ def main():
     )
     bce = torch.nn.BCEWithLogitsLoss()
 
-    best_val = float("inf")
-    os.makedirs("artifacts", exist_ok=True)
-
-    step = 0
-    for epoch in range(1, tcfg["epochs"] + 1):
+    for epoch in range(cfg["train"]["epochs"]):
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{tcfg['epochs']}")
-        running = []
+        losses = []
+        for batch in train_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = model(batch["x_num"], batch["x_cat"])
+            loss = bce(out["logits"], batch["y"])
 
-        for batch in pbar:
-            step += 1
-            batch = batch_to_device(batch, device)
-            out = model(batch["x_num"], batch["x_cat"], batch["t"])
-
-            logits_t = targeted_regularized_logits(out["logits"], batch["t"], out["mu"], out["sigma"], epsilon)
-
-            loss_y = outcome_bce_logits(batch["y"], logits_t)
-            loss_g = gps_gaussian_nll(batch["t"], out["mu"], out["sigma"])
-            loss_tr = epsilon_penalty(epsilon, epsilon_l2=float(lcfg.get("epsilon_l2", 1.0)))
-            loss_m = monotonicity_penalty(
-                model,
-                batch["x_num"],
-                batch["x_cat"],
-                batch["t"],
-                delta=float(lcfg.get("mono_delta", 0.05)),
-                direction=str(lcfg.get("mono_direction", "decreasing")),
-            )
-
-            loss = (
-                float(lcfg.get("w_outcome", 1.0)) * loss_y
-                + float(lcfg.get("w_gps", 1.0)) * loss_g
-                + float(lcfg.get("w_target_reg", 0.0)) * loss_tr
-                + float(lcfg.get("w_mono", 0.0)) * loss_m
-            )
-
-            opt.zero_grad(set_to_none=True)
-            opt_eps.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
             optimizer.step()
 
-            if tcfg.get("grad_clip", None) is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(tcfg["grad_clip"]))
-
-            opt.step()
-            opt_eps.step()
-
-            running.append(loss.item())
-            if step % int(tcfg.get("log_every_steps", 50)) == 0:
-                pbar.set_postfix({
-                    "loss": f"{np.mean(running[-100:]):.4f}",
-                    "bce": f"{loss_y.item():.4f}",
-                    "gps": f"{loss_g.item():.4f}",
-                    "mono": f"{loss_m.item():.4f}",
-                    "eps": f"{epsilon.item():.4f}",
-                })
-
-        val_loss, val_acc = evaluate(model, valid_loader, device, epsilon)
-        print(f"\nVal: loss={val_loss:.4f}, acc={val_acc:.4f}, epsilon={epsilon.item():.4f}")
+            losses.append(loss.item())
 
         print(f"Epoch {epoch + 1} | Loss: {np.mean(losses):.4f}")
 
