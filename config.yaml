@@ -1,0 +1,49 @@
+seed: 42
+device: "cuda"
+
+data:
+  n_train: 60000
+  n_valid: 12000
+  n_num: 14
+  cat_cardinalities: [10, 15, 8, 6]
+  treatment_noise: 0.35
+  outcome_noise: 0.0
+
+preprocess:
+  standardize_numeric: true
+  standardize_treatment: true
+
+train:
+  batch_size: 1024
+  epochs: 12
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 5.0
+  log_every_steps: 50
+
+model:
+  d_hidden: 192
+  n_shared_layers: 3
+  dropout: 0.12
+  emb_dim: 10
+  min_sigma: 0.05
+
+  use_t_mlp: true
+  t_mlp_hidden: 64
+  t_mlp_layers: 2
+
+  use_gamma: true
+  use_cat_offset: true
+  cat_offset_hidden: 64
+
+loss:
+  w_outcome: 1.0
+  w_gps: 1.0
+  w_target_reg: 0.15
+  w_mono: 0.10
+
+  mono_delta: 0.05
+  mono_direction: "decreasing"
+
+  epsilon_init: 0.0
+  epsilon_l2: 1.0
