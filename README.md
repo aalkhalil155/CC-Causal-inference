@@ -1,6 +1,6 @@
-# causal-dragonnet-dummy
+# causal-dragonnet-advanced
 
-Minimal DragonNet-style continuous treatment dummy project.
+This is an **advanced** dummy project that mirrors a DragonNet-style continuous-treatment setup similar to what you described:
 
 ## Run locally
 ```bash
