@@ -161,7 +161,6 @@ def epsilon_penalty(epsilon: torch.Tensor, epsilon_l2: float = 1.0) -> torch.Ten
     return float(epsilon_l2) * (epsilon ** 2).mean()
 
 
-@torch.no_grad()
 def monotonicity_penalty(
     model,
     batch,
@@ -176,6 +175,8 @@ def monotonicity_penalty(
 
     Only works if model.forward depends on 't' (i.e., batch has 't' and forward uses it).
     If model doesn't take t, returns 0.
+
+    NOTE: this term is used during optimization, so it must preserve gradients.
     """
     # If model forward does not accept t, can't compute monotonicity wrt t
     sig = inspect.signature(model.forward)
