@@ -8,7 +8,7 @@ def make_mlp(d_in: int, d_hidden: int, n_layers: int, dropout: float):
     for _ in range(n_layers):
         layers += [nn.Linear(d, d_hidden), nn.ReLU(), nn.Dropout(dropout)]
         d = d_hidden
-    return nn.Sequential(*layers), d_hidden
+    return nn.Sequential(*layers), d
 
 class DragonNetContinuousAdvanced(nn.Module):
     def __init__(
