@@ -1,3 +1,4 @@
+import importlib
 import inspect
 import pathlib
 import sys
@@ -8,31 +9,28 @@ import yaml
 from torch.utils.data import DataLoader
 
 # Support both execution modes:
-# 1) `python train.py` (script mode)
-# 2) `python -m <package>.train` (package mode)
+# 1) python train.py
+# 2) python -m <package>.train
 if __package__ in (None, ""):
     repo_root = pathlib.Path(__file__).resolve().parent
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from data import CausalDataset, generate_synthetic
-    from model import DragonNetContinuous
-    from utils import get_device, set_seed
-
-    try:
-        from model import DragonNetContinuousAdvanced
-    except ImportError:
-        DragonNetContinuousAdvanced = None
+    data_module = importlib.import_module("data")
+    model_module = importlib.import_module("model")
+    utils_module = importlib.import_module("utils")
 else:
-    from .data import CausalDataset, generate_synthetic
-    from .model import DragonNetContinuous
-    from .utils import get_device, set_seed
+    data_module = importlib.import_module(f"{__package__}.data")
+    model_module = importlib.import_module(f"{__package__}.model")
+    utils_module = importlib.import_module(f"{__package__}.utils")
 
-    try:
-        from .model import DragonNetContinuousAdvanced
-    except ImportError:
-        DragonNetContinuousAdvanced = None
+CausalDataset = data_module.CausalDataset
+generate_synthetic = data_module.generate_synthetic
+set_seed = utils_module.set_seed
+get_device = utils_module.get_device
 
+DragonNetContinuous = getattr(model_module, "DragonNetContinuous", None)
+DragonNetContinuousAdvanced = getattr(model_module, "DragonNetContinuousAdvanced", None)
 
 ADVANCED_DEFAULTS = {
     "use_t_mlp": False,
@@ -61,9 +59,21 @@ def load_config():
         return yaml.safe_load(f)
 
 
+def pick_model_class():
+    """Pick an available model class in priority order."""
+    if DragonNetContinuousAdvanced is not None:
+        return DragonNetContinuousAdvanced
+    if DragonNetContinuous is not None:
+        return DragonNetContinuous
+    raise ImportError(
+        "No supported model class found in model.py. "
+        "Expected DragonNetContinuousAdvanced or DragonNetContinuous."
+    )
+
+
 def build_model(dcfg, mcfg, device):
     """Instantiate available model class while filling compatible defaults."""
-    model_cls = DragonNetContinuousAdvanced or DragonNetContinuous
+    model_cls = pick_model_class()
 
     kwargs = {
         "n_num": dcfg["n_num"],
@@ -72,7 +82,7 @@ def build_model(dcfg, mcfg, device):
         "d_hidden": mcfg["d_hidden"],
         "n_shared_layers": mcfg["n_shared_layers"],
         "dropout": mcfg["dropout"],
-        "min_sigma": mcfg["min_sigma"],
+        "min_sigma": mcfg.get("min_sigma", 0.05),
     }
 
     sig = inspect.signature(model_cls.__init__)
@@ -91,7 +101,7 @@ def build_model(dcfg, mcfg, device):
         if param.default is inspect.Parameter.empty:
             raise TypeError(
                 f"Missing required model config parameter: '{name}'. "
-                f"Add it under config['model'] in config.yaml."
+                "Add it under config['model'] in config.yaml."
             )
 
     return model_cls(**kwargs).to(device)
@@ -146,7 +156,7 @@ def main():
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"]["weight_decay"],
+        weight_decay=cfg["train"].get("weight_decay", 0.0),
     )
     bce = torch.nn.BCEWithLogitsLoss()
 
@@ -160,7 +170,7 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"].get("grad_clip", 5.0))
             optimizer.step()
 
             losses.append(loss.item())
