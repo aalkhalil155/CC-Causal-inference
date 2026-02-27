@@ -15,11 +15,11 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_root))
 
     from data import CausalDataset, generate_synthetic
-    from model import DragonNetContinuous
+    from model import DragonNetContinuousAdvanced
     from utils import get_device, set_seed
 else:
     from .data import CausalDataset, generate_synthetic
-    from .model import DragonNetContinuous
+    from .model import DragonNetContinuousAdvanced
     from .utils import get_device, set_seed
 
 
@@ -64,7 +64,7 @@ def main():
         shuffle=True,
     )
 
-    model = DragonNetContinuous(
+    model = DragonNetContinuousAdvanced(
         n_num=dcfg["n_num"],
         cat_cardinalities=dcfg["cat_cardinalities"],
         emb_dim=cfg["model"]["emb_dim"],
