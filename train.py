@@ -16,7 +16,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_root))
 
     from data import CausalDataset, generate_synthetic
-    from model import DragonNetContinuousAdvanced
+    from model import DragonNetContinuous
     from utils import get_device, set_seed
 
     try:
@@ -25,7 +25,7 @@ if __package__ in (None, ""):
         DragonNetContinuousAdvanced = None
 else:
     from .data import CausalDataset, generate_synthetic
-    from .model import DragonNetContinuousAdvanced
+    from .model import DragonNetContinuous
     from .utils import get_device, set_seed
 
     try:
@@ -97,6 +97,26 @@ def build_model(dcfg, mcfg, device):
     return model_cls(**kwargs).to(device)
 
 
+def model_forward(model, batch):
+    """Call model.forward with args required by the active model variant."""
+    sig = inspect.signature(model.forward)
+    forward_kwargs = {}
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+
+        if name in batch:
+            forward_kwargs[name] = batch[name]
+            continue
+
+        if param.default is inspect.Parameter.empty:
+            raise TypeError(
+                f"Model forward requires '{name}' but it is missing from the batch."
+            )
+
+    return model(**forward_kwargs)
+
+
 def main():
     cfg = load_config()
 
@@ -135,7 +155,7 @@ def main():
         losses = []
         for batch in train_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            out = model(batch["x_num"], batch["x_cat"])
+            out = model_forward(model, batch)
             loss = bce(out["logits"], batch["y"])
 
             optimizer.zero_grad()
