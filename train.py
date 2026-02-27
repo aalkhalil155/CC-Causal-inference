@@ -1,3 +1,4 @@
+import inspect
 import pathlib
 import sys
 
@@ -15,12 +16,32 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_root))
 
     from data import CausalDataset, generate_synthetic
-    from model import DragonNetContinuousAdvanced
+    from model import DragonNetContinuous
     from utils import get_device, set_seed
+
+    try:
+        from model import DragonNetContinuousAdvanced
+    except ImportError:
+        DragonNetContinuousAdvanced = None
 else:
     from .data import CausalDataset, generate_synthetic
-    from .model import DragonNetContinuousAdvanced
+    from .model import DragonNetContinuous
     from .utils import get_device, set_seed
+
+    try:
+        from .model import DragonNetContinuousAdvanced
+    except ImportError:
+        DragonNetContinuousAdvanced = None
+
+
+ADVANCED_DEFAULTS = {
+    "use_t_mlp": False,
+    "t_mlp_hidden": 64,
+    "t_mlp_layers": 1,
+    "use_gamma": False,
+    "use_cat_offset": False,
+    "cat_offset_hidden": 32,
+}
 
 
 def find_config_path() -> pathlib.Path:
@@ -38,6 +59,42 @@ def load_config():
     config_path = find_config_path()
     with config_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def build_model(dcfg, mcfg, device):
+    """Instantiate available model class while filling compatible defaults."""
+    model_cls = DragonNetContinuousAdvanced or DragonNetContinuous
+
+    kwargs = {
+        "n_num": dcfg["n_num"],
+        "cat_cardinalities": dcfg["cat_cardinalities"],
+        "emb_dim": mcfg["emb_dim"],
+        "d_hidden": mcfg["d_hidden"],
+        "n_shared_layers": mcfg["n_shared_layers"],
+        "dropout": mcfg["dropout"],
+        "min_sigma": mcfg["min_sigma"],
+    }
+
+    sig = inspect.signature(model_cls.__init__)
+    for name, param in sig.parameters.items():
+        if name == "self" or name in kwargs:
+            continue
+
+        if name in mcfg:
+            kwargs[name] = mcfg[name]
+            continue
+
+        if name in ADVANCED_DEFAULTS:
+            kwargs[name] = ADVANCED_DEFAULTS[name]
+            continue
+
+        if param.default is inspect.Parameter.empty:
+            raise TypeError(
+                f"Missing required model config parameter: '{name}'. "
+                f"Add it under config['model'] in config.yaml."
+            )
+
+    return model_cls(**kwargs).to(device)
 
 
 def main():
@@ -64,15 +121,7 @@ def main():
         shuffle=True,
     )
 
-    model = DragonNetContinuousAdvanced(
-        n_num=dcfg["n_num"],
-        cat_cardinalities=dcfg["cat_cardinalities"],
-        emb_dim=cfg["model"]["emb_dim"],
-        d_hidden=cfg["model"]["d_hidden"],
-        n_shared_layers=cfg["model"]["n_shared_layers"],
-        dropout=cfg["model"]["dropout"],
-        min_sigma=cfg["model"]["min_sigma"],
-    ).to(device)
+    model = build_model(dcfg, cfg["model"], device)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
