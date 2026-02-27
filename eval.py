@@ -7,10 +7,10 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, roc_auc_score
 
-from .utils import get_device, set_seed, batch_to_device
-from .data import generate_synthetic, CausalDataset
-from .preprocess import Standardizer
-from .model import DragonNetContinuousAdvanced
+from utils import get_device, set_seed, batch_to_device
+from data import generate_synthetic, CausalDataset
+from preprocess import Standardizer
+from model import DragonNetContinuousAdvanced
 
 
 # -------------------------
