@@ -12,7 +12,7 @@ from utils import get_device, set_seed, batch_to_device
 from data import generate_synthetic, CausalDataset
 from preprocess import Standardizer
 from model import DragonNetContinuousAdvanced
-
+from scipy.stats import spearmanr
 
 # -------------------------
 # Helpers
@@ -335,7 +335,120 @@ def plot_monotonicity_violations(
         plt.show()
     plt.close()
 
+@torch.no_grad()
+def compute_local_treatment_effects(
+    model,
+    x_num,
+    x_cat,
+    t_obs,
+    device,
+    delta=0.02,
+    batch_size=4096,
+):
+    """
+    Compute local treatment effect at observed treatment:
+        d_hat ≈ [p(t+delta) - p(t-delta)] / (2*delta)
 
+    Returns:
+        t_obs: (N,)
+        d_hat: (N,)
+    """
+    model.eval()
+
+    x_num_t = torch.tensor(x_num, dtype=torch.float32, device=device)
+    x_cat_t = torch.tensor(x_cat, dtype=torch.long, device=device)
+    t_t = torch.tensor(t_obs, dtype=torch.float32, device=device).view(-1, 1)
+
+    N = x_num_t.shape[0]
+    d_hat = np.zeros(N, dtype=np.float32)
+
+    for i in range(0, N, batch_size):
+        xb = x_num_t[i:i+batch_size]
+        cb = x_cat_t[i:i+batch_size]
+        tb = t_t[i:i+batch_size]
+
+        out_plus = model(xb, cb, tb + delta)
+        out_minus = model(xb, cb, tb - delta)
+
+        p_plus = torch.sigmoid(out_plus["logits"]).detach().cpu().numpy().reshape(-1)
+        p_minus = torch.sigmoid(out_minus["logits"]).detach().cpu().numpy().reshape(-1)
+
+        d_hat[i:i+batch_size] = (p_plus - p_minus) / (2.0 * delta)
+
+    return np.asarray(t_obs).reshape(-1), d_hat
+
+
+def plot_monotonicity_scatter(
+    t_obs,
+    d_hat,
+    bins=40,
+    sample_points=12000,
+    title_prefix="Monotonicity",
+    outpath=None,
+):
+    """
+    Plot:
+      - scatter of local derivative vs treatment
+      - binned average derivative line
+      - Spearman rho and p-value in title
+    """
+    t_obs = np.asarray(t_obs).reshape(-1)
+    d_hat = np.asarray(d_hat).reshape(-1)
+
+    mask = np.isfinite(t_obs) & np.isfinite(d_hat)
+    t_obs = t_obs[mask]
+    d_hat = d_hat[mask]
+
+    # optional downsample for scatter readability
+    if len(t_obs) > sample_points:
+        idx = np.random.choice(len(t_obs), size=sample_points, replace=False)
+        t_scatter = t_obs[idx]
+        d_scatter = d_hat[idx]
+    else:
+        t_scatter = t_obs
+        d_scatter = d_hat
+
+    # Spearman
+    rho, pval = spearmanr(t_obs, d_hat)
+
+    # binned mean line
+    edges = np.quantile(t_obs, np.linspace(0, 1, bins + 1))
+    # protect against repeated edges
+    edges = np.unique(edges)
+    if len(edges) < 3:
+        edges = np.linspace(t_obs.min(), t_obs.max(), bins + 1)
+
+    centers = []
+    means = []
+
+    for j in range(len(edges) - 1):
+        if j < len(edges) - 2:
+            m = (t_obs >= edges[j]) & (t_obs < edges[j + 1])
+        else:
+            m = (t_obs >= edges[j]) & (t_obs <= edges[j + 1])
+
+        if m.sum() == 0:
+            continue
+
+        centers.append(0.5 * (edges[j] + edges[j + 1]))
+        means.append(d_hat[m].mean())
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(t_scatter, d_scatter, s=8, alpha=0.25)
+    plt.plot(centers, means, linewidth=3)
+
+    plt.axhline(0.0, linestyle="--", linewidth=1.5, color="gray")
+
+    plt.xlabel("Treatment")
+    plt.ylabel("Local treatment effect dP/dt")
+    plt.title(f"{title_prefix}\nSpearman ρ = {rho:.3f}, p = {pval:.3g}")
+    plt.grid(True)
+
+    if outpath:
+        plt.savefig(outpath, bbox_inches="tight", dpi=150)
+    else:
+        plt.show()
+    plt.close()
 # -------------------------
 # CLI
 # -------------------------
@@ -416,6 +529,28 @@ def main():
     print("Saved monotonicity plots.")
 
     print(f"All plots saved to: {args.outdir}")
+
+
+        # Monotonicity scatter (NEW: like your screenshot)
+    t_eff, d_eff = compute_local_treatment_effects(
+        model=model,
+        x_num=pred["x_num"],
+        x_cat=pred["x_cat"],
+        t_obs=pred["t"],
+        device=device,
+        delta=0.02,
+        batch_size=4096,
+    )
+
+    plot_monotonicity_scatter(
+        t_obs=t_eff,
+        d_hat=d_eff,
+        bins=40,
+        sample_points=12000,
+        title_prefix="Monotonicity",
+        outpath=f"{args.outdir}/monotonicity_scatter.png",
+    )
+    print("Saved monotonicity scatter plot.")
 
 
 if __name__ == "__main__":
