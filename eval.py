@@ -59,6 +59,8 @@ def make_valid_loader(cfg: dict, seed_offset: int = 1):
         seed=cfg["seed"] + seed_offset,
     )
 
+    # For a dummy project this is okay.
+    # In a stricter setup, load train scalers from checkpoint and apply them here.
     if pcfg.get("standardize_numeric", True):
         x_scaler = Standardizer().fit(x_num)
         x_num = x_scaler.transform(x_num).astype(np.float32)
@@ -112,9 +114,9 @@ def plot_roc(y, p, outpath=None):
     auc = roc_auc_score(y, p)
     fpr, tpr, _ = roc_curve(y, p)
 
-    plt.figure()
-    plt.plot(fpr, tpr)
-    plt.plot([0, 1], [0, 1])
+    plt.figure(figsize=(7, 5))
+    plt.plot(fpr, tpr, linewidth=2)
+    plt.plot([0, 1], [0, 1], linestyle="--")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
     plt.title(f"ROC Curve (AUC={auc:.4f})")
@@ -160,7 +162,7 @@ def plot_gps_overlap_by_treatment_quantiles(
         vals = gps[mask]
         hist, edges = np.histogram(vals, bins=80, density=True)
         centers = 0.5 * (edges[1:] + edges[:-1])
-        plt.plot(centers, hist, label=f"Q{k+1}")
+        plt.plot(centers, hist, linewidth=2, label=f"Q{k+1}")
 
     plt.xlabel("GPS")
     plt.ylabel("Density")
@@ -233,7 +235,7 @@ def plot_heterogeneity_max_min_hist(
 
     hist, edges = np.histogram(H, bins=120, density=False)
     centers = 0.5 * (edges[1:] + edges[:-1])
-    plt.plot(centers, hist)
+    plt.plot(centers, hist, linewidth=2)
 
     plt.axvline(v, linestyle="--", linewidth=2)
 
@@ -388,7 +390,7 @@ def plot_monotonicity_violations(
 
     viol_rate = viol.mean(axis=1)
 
-    plt.figure()
+    plt.figure(figsize=(7, 5))
     plt.hist(viol_rate, bins=50, density=True, alpha=0.8)
     plt.xlabel("Per-customer monotonicity violation rate")
     plt.ylabel("Density")
@@ -400,8 +402,8 @@ def plot_monotonicity_violations(
         plt.show()
     plt.close()
 
-    plt.figure()
-    plt.plot(t_grid, P.mean(axis=0))
+    plt.figure(figsize=(7, 5))
+    plt.plot(t_grid, P.mean(axis=0), linewidth=2)
     plt.xlabel("Treatment t (standardized)")
     plt.ylabel("Mean predicted P(Y=1 | x, t)")
     plt.title("Average dose-response curve (sanity check)")
@@ -415,19 +417,24 @@ def plot_monotonicity_violations(
 
 
 # -------------------------
-# 6) Multi-arm scoring and curves
+# 6) Multi-arm Qini-style curves
 # -------------------------
 @torch.no_grad()
-def score_candidate_arms(
+def score_candidate_arms_with_value(
     model,
     x_num,
     x_cat,
     device,
     candidate_arms,
+    balance=None,
     batch_size=4096,
 ):
     """
-    P[i, k] = predicted P(Y=1 | x_i, arm_k)
+    Demo synthetic definitions:
+      spend = arm * balance
+      gain  = P * arm * balance
+
+    Replace these with your real business formulas in your real project.
     """
     model.eval()
 
@@ -436,7 +443,14 @@ def score_candidate_arms(
 
     N = x_num_t.shape[0]
     K = len(candidate_arms)
+
+    if balance is None:
+        balance = np.ones(N, dtype=np.float32)
+    balance = np.asarray(balance, dtype=np.float32).reshape(-1)
+
     P = np.zeros((N, K), dtype=np.float32)
+    spend = np.zeros((N, K), dtype=np.float32)
+    gain = np.zeros((N, K), dtype=np.float32)
 
     for k, arm in enumerate(candidate_arms):
         for i in range(0, N, batch_size):
@@ -448,81 +462,201 @@ def score_candidate_arms(
             p = torch.sigmoid(out["logits"]).detach().cpu().numpy().reshape(-1)
             P[i:i + batch_size, k] = p
 
-    return P
-
-
-def build_multi_arm_curve_data(
-    P,
-    candidate_arms,
-    baseline_arm=None,
-    objective="acceptance",
-    balance=None,
-):
-    """
-    Build ranking data for multi-arm policy curves.
-    """
-    candidate_arms = np.asarray(candidate_arms, dtype=np.float32)
-    N, K = P.shape
-
-    if baseline_arm is None:
-        baseline_idx = K // 2
-    else:
-        baseline_idx = int(np.argmin(np.abs(candidate_arms - baseline_arm)))
-
-    if objective == "acceptance":
-        value = P.copy()
-
-    elif objective == "profit":
-        if balance is None:
-            balance = np.ones(N, dtype=np.float32)
-        balance = np.asarray(balance).reshape(-1, 1)
-
-        arm_value = candidate_arms.reshape(1, -1)
-        value = P * arm_value * balance
-
-    else:
-        raise ValueError("objective must be 'acceptance' or 'profit'")
-
-    best_idx = np.argmax(value, axis=1)
-    best_value = value[np.arange(N), best_idx]
-    baseline_value = value[np.arange(N), baseline_idx]
-
-    uplift = best_value - baseline_value
-
-    order = np.argsort(-uplift)
-    uplift_sorted = uplift[order]
-
-    cum_uplift = np.cumsum(uplift_sorted)
-    frac = (np.arange(1, N + 1) / N).astype(np.float32)
+        spend[:, k] = np.maximum(float(arm), 0.0) * balance
+        gain[:, k] = P[:, k] * float(arm) * balance
 
     return {
-        "order": order,
-        "best_idx": best_idx,
-        "baseline_idx": baseline_idx,
-        "best_value": best_value,
-        "baseline_value": baseline_value,
-        "uplift": uplift,
-        "cum_uplift": cum_uplift,
-        "frac": frac,
-        "value": value,
+        "P": P,
+        "spend": spend,
+        "gain": gain,
     }
 
 
-def plot_multi_arm_curve(
-    frac,
-    cum_uplift,
-    title="Multi-Arm Policy Curve",
-    ylabel="Cumulative uplift",
+def _cumulative_curve_from_rank(spend_vec, gain_vec, order):
+    spend_sorted = spend_vec[order]
+    gain_sorted = gain_vec[order]
+
+    cum_spend = np.cumsum(spend_sorted)
+    cum_gain = np.cumsum(gain_sorted)
+    return cum_spend, cum_gain
+
+
+def build_single_arm_curves(
+    spend,
+    gain,
+    arm_labels=None,
+):
+    N, K = gain.shape
+    curves = []
+
+    for k in range(K):
+        s = spend[:, k].copy()
+        g = gain[:, k].copy()
+
+        eff = np.where(s > 1e-12, g / s, -np.inf)
+        order = np.argsort(-eff)
+
+        cum_spend, cum_gain = _cumulative_curve_from_rank(s, g, order)
+
+        label = f"Arm {k}" if arm_labels is None else arm_labels[k]
+        curves.append({
+            "label": label,
+            "cum_spend": cum_spend,
+            "cum_gain": cum_gain,
+            "order": order,
+        })
+
+    return curves
+
+
+def build_multi_arm_optimal_curve(
+    spend,
+    gain,
+):
+    eff = np.where(spend > 1e-12, gain / spend, -np.inf)
+    best_idx = np.argmax(eff, axis=1)
+
+    row_idx = np.arange(spend.shape[0])
+    best_spend = spend[row_idx, best_idx]
+    best_gain = gain[row_idx, best_idx]
+    best_eff = eff[row_idx, best_idx]
+
+    order = np.argsort(-best_eff)
+    cum_spend, cum_gain = _cumulative_curve_from_rank(best_spend, best_gain, order)
+
+    return {
+        "best_idx": best_idx,
+        "best_spend": best_spend,
+        "best_gain": best_gain,
+        "best_eff": best_eff,
+        "cum_spend": cum_spend,
+        "cum_gain": cum_gain,
+        "order": order,
+    }
+
+
+def build_historical_curve(
+    t_obs,
+    candidate_arms,
+    balance,
+    p_obs=None,
+):
+    candidate_arms = np.asarray(candidate_arms, dtype=np.float32)
+    t_obs = np.asarray(t_obs, dtype=np.float32).reshape(-1)
+    balance = np.asarray(balance, dtype=np.float32).reshape(-1)
+
+    nearest_idx = np.argmin(
+        np.abs(t_obs.reshape(-1, 1) - candidate_arms.reshape(1, -1)),
+        axis=1,
+    )
+    chosen_arm = candidate_arms[nearest_idx]
+
+    if p_obs is None:
+        p_obs = np.ones_like(t_obs, dtype=np.float32)
+    else:
+        p_obs = np.asarray(p_obs, dtype=np.float32).reshape(-1)
+
+    spend_hist = np.maximum(chosen_arm, 0.0) * balance
+    gain_hist = p_obs * chosen_arm * balance
+
+    eff_hist = np.where(spend_hist > 1e-12, gain_hist / spend_hist, -np.inf)
+    order = np.argsort(-eff_hist)
+
+    cum_spend, cum_gain = _cumulative_curve_from_rank(spend_hist, gain_hist, order)
+
+    return {
+        "nearest_idx": nearest_idx,
+        "chosen_arm": chosen_arm,
+        "cum_spend": cum_spend,
+        "cum_gain": cum_gain,
+        "order": order,
+    }
+
+
+def bootstrap_multi_arm_ci(
+    spend,
+    gain,
+    n_boot=50,
+    seed=42,
+):
+    rng = np.random.default_rng(seed)
+    N = spend.shape[0]
+
+    base = build_multi_arm_optimal_curve(spend, gain)
+    x_grid = base["cum_spend"]
+
+    ys = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, N, size=N)
+        spend_b = spend[idx]
+        gain_b = gain[idx]
+
+        curve_b = build_multi_arm_optimal_curve(spend_b, gain_b)
+        xb = curve_b["cum_spend"]
+        yb = curve_b["cum_gain"]
+
+        xb = np.maximum.accumulate(xb)
+        if xb[-1] <= 0:
+            ys.append(np.zeros_like(x_grid))
+            continue
+
+        x_target = np.clip(x_grid, xb.min(), xb.max())
+        y_interp = np.interp(x_target, xb, yb)
+        ys.append(y_interp)
+
+    ys = np.vstack(ys)
+    y_lo = np.percentile(ys, 2.5, axis=0)
+    y_hi = np.percentile(ys, 97.5, axis=0)
+
+    return x_grid, y_lo, y_hi
+
+
+def plot_multi_arm_qini_curves(
+    single_arm_curves,
+    multi_arm_curve,
+    historical_curve=None,
+    ci_band=None,
+    title="Qini Curves (Pointer Logic)",
+    subtitle=None,
     outpath=None,
 ):
-    plt.figure(figsize=(8, 5))
-    plt.plot(frac, cum_uplift, linewidth=2)
-    plt.axhline(0.0, linestyle="--", linewidth=1.2, color="gray")
+    plt.figure(figsize=(10, 6))
 
-    plt.xlabel("Fraction of population targeted")
-    plt.ylabel(ylabel)
-    plt.title(title)
+    for c in single_arm_curves:
+        plt.plot(
+            c["cum_spend"],
+            c["cum_gain"],
+            linestyle="--",
+            linewidth=2,
+            label=c["label"],
+        )
+
+    plt.plot(
+        multi_arm_curve["cum_spend"],
+        multi_arm_curve["cum_gain"],
+        linewidth=3.5,
+        label="Multi-Arm (Optimal)",
+    )
+
+    if ci_band is not None:
+        x_ci, y_lo, y_hi = ci_band
+        plt.fill_between(x_ci, y_lo, y_hi, alpha=0.2, label="Multi-Arm 95% CI")
+
+    if historical_curve is not None:
+        plt.plot(
+            historical_curve["cum_spend"],
+            historical_curve["cum_gain"],
+            linestyle=":",
+            linewidth=3,
+            label="Observed Policy (Historical)",
+        )
+
+    plt.xlabel("Cumulative Discount Spend ($)")
+    plt.ylabel("Cumulative Gain (expected $ interest)")
+    ttl = title if subtitle is None else f"{title}\n{subtitle}"
+    plt.title(ttl)
     plt.grid(True)
+    plt.legend()
 
     if outpath:
         plt.savefig(outpath, bbox_inches="tight", dpi=150)
@@ -559,6 +693,7 @@ def main():
     ap.add_argument("--gps_quantiles", type=int, default=5)
     ap.add_argument("--hetero_grid_points", type=int, default=60)
     ap.add_argument("--mono_delta", type=float, default=0.02)
+    ap.add_argument("--n_boot", type=int, default=50)
     args = ap.parse_args()
 
     with open(args.config, "r") as f:
@@ -648,68 +783,70 @@ def main():
     print("Saved monotonicity plots.")
 
     # -------------------------
-    # Multi-arm curves
+    # Multi-arm Qini-style curves
     # -------------------------
-    candidate_arms = np.array([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=np.float32)
+    candidate_arms = np.array([0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14], dtype=np.float32)
+    arm_labels = [f"Single-Arm: Bin {i+1}" for i in range(len(candidate_arms))]
 
-    P_arms = score_candidate_arms(
+    # Demo balance proxy. Replace with real balance in your project.
+    fake_balance = (50000.0 * np.exp(0.25 * pred["x_num"][:, 0])).astype(np.float32)
+
+    scored = score_candidate_arms_with_value(
         model=model,
         x_num=pred["x_num"],
         x_cat=pred["x_cat"],
         device=device,
         candidate_arms=candidate_arms,
+        balance=fake_balance,
         batch_size=4096,
     )
 
-    # Acceptance objective
-    multi_accept = build_multi_arm_curve_data(
-        P=P_arms,
-        candidate_arms=candidate_arms,
-        baseline_arm=0.0,
-        objective="acceptance",
+    P_arms = scored["P"]
+    spend = scored["spend"]
+    gain = scored["gain"]
+
+    single_arm_curves = build_single_arm_curves(
+        spend=spend,
+        gain=gain,
+        arm_labels=arm_labels,
     )
 
-    plot_multi_arm_curve(
-        frac=multi_accept["frac"],
-        cum_uplift=multi_accept["cum_uplift"],
-        title="Multi-Arm Curve (Acceptance Objective)",
-        ylabel="Cumulative predicted acceptance uplift",
-        outpath=f"{args.outdir}/multi_arm_curve_acceptance.png",
+    multi_arm_curve = build_multi_arm_optimal_curve(
+        spend=spend,
+        gain=gain,
     )
 
-    plot_best_arm_distribution(
-        best_idx=multi_accept["best_idx"],
+    historical_curve = build_historical_curve(
+        t_obs=pred["t"],
         candidate_arms=candidate_arms,
-        outpath=f"{args.outdir}/multi_arm_best_arm_acceptance.png",
-    )
-    print("Saved multi-arm acceptance plots.")
-
-    # Profit objective (demo)
-    fake_balance = np.exp(pred["x_num"][:, 0] * 0.5).astype(np.float32)
-
-    multi_profit = build_multi_arm_curve_data(
-        P=P_arms,
-        candidate_arms=candidate_arms,
-        baseline_arm=0.0,
-        objective="profit",
         balance=fake_balance,
+        p_obs=pred["p"],
     )
 
-    plot_multi_arm_curve(
-        frac=multi_profit["frac"],
-        cum_uplift=multi_profit["cum_uplift"],
-        title="Multi-Arm Curve (Profit Objective)",
-        ylabel="Cumulative predicted profit uplift",
-        outpath=f"{args.outdir}/multi_arm_curve_profit.png",
+    ci_band = bootstrap_multi_arm_ci(
+        spend=spend,
+        gain=gain,
+        n_boot=args.n_boot,
+        seed=cfg["seed"],
+    )
+
+    plot_multi_arm_qini_curves(
+        single_arm_curves=single_arm_curves,
+        multi_arm_curve=multi_arm_curve,
+        historical_curve=historical_curve,
+        ci_band=ci_band,
+        title="Qini Curves (Pointer Logic)",
+        subtitle="(Demo Synthetic Data)",
+        outpath=f"{args.outdir}/multi_arm_qini_curves.png",
     )
 
     plot_best_arm_distribution(
-        best_idx=multi_profit["best_idx"],
+        best_idx=multi_arm_curve["best_idx"],
         candidate_arms=candidate_arms,
-        outpath=f"{args.outdir}/multi_arm_best_arm_profit.png",
+        outpath=f"{args.outdir}/multi_arm_best_arm_distribution.png",
     )
-    print("Saved multi-arm profit plots.")
 
+    print("Saved multi-arm Qini-style curves.")
     print(f"All plots saved to: {args.outdir}")
 
 
