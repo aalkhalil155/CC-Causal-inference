@@ -7,11 +7,10 @@ from torch.utils.data import DataLoader
 
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, roc_auc_score
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, gaussian_kde
 
 from utils import get_device, set_seed, batch_to_device
 from data import generate_synthetic, CausalDataset
-from preprocess import Standardizer
 from model import DragonNetContinuousAdvanced
 
 
@@ -46,9 +45,23 @@ def build_model_from_config(cfg: dict) -> DragonNetContinuousAdvanced:
     return model
 
 
-def make_valid_loader(cfg: dict, seed_offset: int = 1):
+def transform_with_saved_scalers(x_num, t, ckpt):
+    x_mean = ckpt.get("x_scaler_mean", None)
+    x_std = ckpt.get("x_scaler_std", None)
+    t_mean = ckpt.get("t_scaler_mean", None)
+    t_std = ckpt.get("t_scaler_std", None)
+
+    if x_mean is not None and x_std is not None:
+        x_num = (x_num - np.asarray(x_mean)) / np.asarray(x_std)
+
+    if t_mean is not None and t_std is not None:
+        t = ((t.reshape(-1, 1) - np.asarray(t_mean)) / np.asarray(t_std)).reshape(-1)
+
+    return x_num.astype(np.float32), t.astype(np.float32)
+
+
+def make_valid_loader(cfg: dict, ckpt: dict, seed_offset: int = 1):
     dcfg = cfg["data"]
-    pcfg = cfg.get("preprocess", {})
 
     x_num, x_cat, t, y = generate_synthetic(
         n=dcfg["n_valid"],
@@ -59,15 +72,7 @@ def make_valid_loader(cfg: dict, seed_offset: int = 1):
         seed=cfg["seed"] + seed_offset,
     )
 
-    # For a dummy project this is okay.
-    # In a stricter setup, load train scalers from checkpoint and apply them here.
-    if pcfg.get("standardize_numeric", True):
-        x_scaler = Standardizer().fit(x_num)
-        x_num = x_scaler.transform(x_num).astype(np.float32)
-
-    if pcfg.get("standardize_treatment", True):
-        t_scaler = Standardizer().fit(t.reshape(-1, 1))
-        t = t_scaler.transform(t.reshape(-1, 1)).reshape(-1).astype(np.float32)
+    x_num, t = transform_with_saved_scalers(x_num, t, ckpt)
 
     ds = CausalDataset(x_num, x_cat, t, y)
     loader = DataLoader(ds, batch_size=2048, shuffle=False, num_workers=0)
@@ -108,18 +113,19 @@ def predict_all(model, loader, device):
 
 
 # -------------------------
-# 1) ROC / AUC
+# ROC
 # -------------------------
 def plot_roc(y, p, outpath=None):
     auc = roc_auc_score(y, p)
     fpr, tpr, _ = roc_curve(y, p)
 
     plt.figure(figsize=(7, 5))
-    plt.plot(fpr, tpr, linewidth=2)
+    plt.plot(fpr, tpr, linewidth=2, label=f"OOT AUC={auc:.2f}")
     plt.plot([0, 1], [0, 1], linestyle="--")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title(f"ROC Curve (AUC={auc:.4f})")
+    plt.title("ROC Curve")
+    plt.legend()
     plt.grid(True)
 
     if outpath:
@@ -131,7 +137,7 @@ def plot_roc(y, p, outpath=None):
 
 
 # -------------------------
-# 2) GPS overlap (by treatment quantiles)
+# GPS overlap (smoothed)
 # -------------------------
 def gaussian_pdf(t, mu, sigma):
     sigma = np.clip(sigma, 1e-6, None)
@@ -148,21 +154,22 @@ def plot_gps_overlap_by_treatment_quantiles(
     outpath=None,
 ):
     gps = gaussian_pdf(t, mu, sigma)
+    gps = np.clip(gps, np.quantile(gps, 0.001), np.quantile(gps, 0.999))
 
     qs = np.quantile(t, np.linspace(0, 1, n_quantiles + 1))
     q_idx = np.digitize(t, qs[1:-1], right=True)
 
     plt.figure(figsize=(8, 5))
 
+    x_grid = np.linspace(gps.min(), gps.max(), 300)
     for k in range(n_quantiles):
-        mask = q_idx == k
-        if mask.sum() < 20:
+        vals = gps[q_idx == k]
+        if len(vals) < 20:
             continue
 
-        vals = gps[mask]
-        hist, edges = np.histogram(vals, bins=80, density=True)
-        centers = 0.5 * (edges[1:] + edges[:-1])
-        plt.plot(centers, hist, linewidth=2, label=f"Q{k+1}")
+        kde = gaussian_kde(vals)
+        y_grid = kde(x_grid)
+        plt.plot(x_grid, y_grid, linewidth=2, label=f"Q{k+1}")
 
     plt.xlabel("GPS")
     plt.ylabel("Density")
@@ -178,7 +185,7 @@ def plot_gps_overlap_by_treatment_quantiles(
 
 
 # -------------------------
-# 3) Heterogeneity = max-min across treatment grid
+# Heterogeneity
 # -------------------------
 @torch.no_grad()
 def compute_heterogeneity_max_min(
@@ -225,17 +232,16 @@ def plot_heterogeneity_max_min_hist(
     H = np.asarray(H).reshape(-1)
     H = H[np.isfinite(H)]
 
-    if vline == "median":
-        v = float(np.median(H))
-    else:
-        v = float(np.mean(H))
+    v = float(np.mean(H)) if vline == "mean" else float(np.median(H))
 
     plt.figure(figsize=(8, 5))
-    plt.hist(H, bins=bins, density=False, alpha=0.6)
+    plt.hist(H, bins=bins, density=False, alpha=0.55)
 
-    hist, edges = np.histogram(H, bins=120, density=False)
-    centers = 0.5 * (edges[1:] + edges[:-1])
-    plt.plot(centers, hist, linewidth=2)
+    x_grid = np.linspace(H.min(), H.max(), 300)
+    kde = gaussian_kde(H)
+    y_grid = kde(x_grid)
+    scale = len(H) * (H.max() - H.min()) / bins
+    plt.plot(x_grid, y_grid * scale, linewidth=2)
 
     plt.axvline(v, linestyle="--", linewidth=2)
 
@@ -252,7 +258,7 @@ def plot_heterogeneity_max_min_hist(
 
 
 # -------------------------
-# 4) Monotonicity scatter
+# Monotonicity
 # -------------------------
 @torch.no_grad()
 def compute_local_treatment_effects(
@@ -297,9 +303,6 @@ def plot_monotonicity_scatter(
     title_prefix="Monotonicity",
     outpath=None,
 ):
-    t_obs = np.asarray(t_obs).reshape(-1)
-    d_hat = np.asarray(d_hat).reshape(-1)
-
     mask = np.isfinite(t_obs) & np.isfinite(d_hat)
     t_obs = t_obs[mask]
     d_hat = d_hat[mask]
@@ -319,9 +322,7 @@ def plot_monotonicity_scatter(
     if len(edges) < 3:
         edges = np.linspace(t_obs.min(), t_obs.max(), bins + 1)
 
-    centers = []
-    means = []
-
+    centers, means = [], []
     for j in range(len(edges) - 1):
         if j < len(edges) - 2:
             m = (t_obs >= edges[j]) & (t_obs < edges[j + 1])
@@ -330,15 +331,13 @@ def plot_monotonicity_scatter(
 
         if m.sum() == 0:
             continue
-
         centers.append(0.5 * (edges[j] + edges[j + 1]))
         means.append(d_hat[m].mean())
 
     plt.figure(figsize=(8, 6))
-    plt.scatter(t_scatter, d_scatter, s=8, alpha=0.25)
+    plt.scatter(t_scatter, d_scatter, s=8, alpha=0.2)
     plt.plot(centers, means, linewidth=3)
     plt.axhline(0.0, linestyle="--", linewidth=1.5, color="gray")
-
     plt.xlabel("Treatment")
     plt.ylabel("Local treatment effect dP/dt")
     plt.title(f"{title_prefix}\nSpearman ρ = {rho:.3f}, p = {pval:.3g}")
@@ -351,9 +350,6 @@ def plot_monotonicity_scatter(
     plt.close()
 
 
-# -------------------------
-# 5) Monotonicity violations + average curve
-# -------------------------
 @torch.no_grad()
 def plot_monotonicity_violations(
     model,
@@ -369,7 +365,6 @@ def plot_monotonicity_violations(
     x_cat_t = torch.tensor(x_cat, dtype=torch.long, device=device)
 
     t_grid = np.linspace(-2.0, 2.0, grid_points).astype(np.float32)
-
     N = x_num_t.shape[0]
     batch = 4096
     P = np.zeros((N, grid_points), dtype=np.float32)
@@ -383,11 +378,7 @@ def plot_monotonicity_violations(
         P[:, j] = np.vstack(ps).reshape(-1)
 
     d = np.diff(P, axis=1)
-    if direction == "decreasing":
-        viol = d > 1e-6
-    else:
-        viol = d < -1e-6
-
+    viol = (d > 1e-6) if direction == "decreasing" else (d < -1e-6)
     viol_rate = viol.mean(axis=1)
 
     plt.figure(figsize=(7, 5))
@@ -417,25 +408,17 @@ def plot_monotonicity_violations(
 
 
 # -------------------------
-# 6) Multi-arm Qini-style curves
+# Qini helpers: plug-in style
 # -------------------------
 @torch.no_grad()
-def score_candidate_arms_with_value(
+def score_candidate_arms_prob(
     model,
     x_num,
     x_cat,
     device,
     candidate_arms,
-    balance=None,
     batch_size=4096,
 ):
-    """
-    Demo synthetic definitions:
-      spend = arm * balance
-      gain  = P * arm * balance
-
-    Replace these with your real business formulas in your real project.
-    """
     model.eval()
 
     x_num_t = torch.tensor(x_num, dtype=torch.float32, device=device)
@@ -443,14 +426,7 @@ def score_candidate_arms_with_value(
 
     N = x_num_t.shape[0]
     K = len(candidate_arms)
-
-    if balance is None:
-        balance = np.ones(N, dtype=np.float32)
-    balance = np.asarray(balance, dtype=np.float32).reshape(-1)
-
     P = np.zeros((N, K), dtype=np.float32)
-    spend = np.zeros((N, K), dtype=np.float32)
-    gain = np.zeros((N, K), dtype=np.float32)
 
     for k, arm in enumerate(candidate_arms):
         for i in range(0, N, batch_size):
@@ -462,41 +438,35 @@ def score_candidate_arms_with_value(
             p = torch.sigmoid(out["logits"]).detach().cpu().numpy().reshape(-1)
             P[i:i + batch_size, k] = p
 
-        spend[:, k] = np.maximum(float(arm), 0.0) * balance
-        gain[:, k] = P[:, k] * float(arm) * balance
-
-    return {
-        "P": P,
-        "spend": spend,
-        "gain": gain,
-    }
+    return P
 
 
-def _cumulative_curve_from_rank(spend_vec, gain_vec, order):
-    spend_sorted = spend_vec[order]
-    gain_sorted = gain_vec[order]
+def build_demo_spend_gain_from_prob(P, candidate_arms, balance):
+    """
+    Replace this later with your real mortgage formulas.
+    """
+    candidate_arms = np.asarray(candidate_arms, dtype=np.float32)
+    balance = np.asarray(balance, dtype=np.float32).reshape(-1)
+    arm_row = candidate_arms.reshape(1, -1)
+    bal_col = balance.reshape(-1, 1)
 
-    cum_spend = np.cumsum(spend_sorted)
-    cum_gain = np.cumsum(gain_sorted)
-    return cum_spend, cum_gain
+    spend = np.maximum(arm_row, 0.0) * bal_col
+    gain = P * arm_row * bal_col
+    return spend, gain
 
 
-def build_single_arm_curves(
-    spend,
-    gain,
-    arm_labels=None,
-):
+def build_single_arm_curves(spend, gain, arm_labels=None):
     N, K = gain.shape
     curves = []
 
     for k in range(K):
         s = spend[:, k].copy()
         g = gain[:, k].copy()
-
         eff = np.where(s > 1e-12, g / s, -np.inf)
         order = np.argsort(-eff)
 
-        cum_spend, cum_gain = _cumulative_curve_from_rank(s, g, order)
+        cum_spend = np.cumsum(s[order])
+        cum_gain = np.cumsum(g[order])
 
         label = f"Arm {k}" if arm_labels is None else arm_labels[k]
         curves.append({
@@ -509,10 +479,7 @@ def build_single_arm_curves(
     return curves
 
 
-def build_multi_arm_optimal_curve(
-    spend,
-    gain,
-):
+def build_multi_arm_optimal_curve(spend, gain):
     eff = np.where(spend > 1e-12, gain / spend, -np.inf)
     best_idx = np.argmax(eff, axis=1)
 
@@ -522,7 +489,8 @@ def build_multi_arm_optimal_curve(
     best_eff = eff[row_idx, best_idx]
 
     order = np.argsort(-best_eff)
-    cum_spend, cum_gain = _cumulative_curve_from_rank(best_spend, best_gain, order)
+    cum_spend = np.cumsum(best_spend[order])
+    cum_gain = np.cumsum(best_gain[order])
 
     return {
         "best_idx": best_idx,
@@ -535,15 +503,11 @@ def build_multi_arm_optimal_curve(
     }
 
 
-def build_historical_curve(
-    t_obs,
-    candidate_arms,
-    balance,
-    p_obs=None,
-):
+def build_historical_curve(t_obs, candidate_arms, balance, p_obs):
     candidate_arms = np.asarray(candidate_arms, dtype=np.float32)
     t_obs = np.asarray(t_obs, dtype=np.float32).reshape(-1)
     balance = np.asarray(balance, dtype=np.float32).reshape(-1)
+    p_obs = np.asarray(p_obs, dtype=np.float32).reshape(-1)
 
     nearest_idx = np.argmin(
         np.abs(t_obs.reshape(-1, 1) - candidate_arms.reshape(1, -1)),
@@ -551,18 +515,14 @@ def build_historical_curve(
     )
     chosen_arm = candidate_arms[nearest_idx]
 
-    if p_obs is None:
-        p_obs = np.ones_like(t_obs, dtype=np.float32)
-    else:
-        p_obs = np.asarray(p_obs, dtype=np.float32).reshape(-1)
-
     spend_hist = np.maximum(chosen_arm, 0.0) * balance
     gain_hist = p_obs * chosen_arm * balance
 
     eff_hist = np.where(spend_hist > 1e-12, gain_hist / spend_hist, -np.inf)
     order = np.argsort(-eff_hist)
 
-    cum_spend, cum_gain = _cumulative_curve_from_rank(spend_hist, gain_hist, order)
+    cum_spend = np.cumsum(spend_hist[order])
+    cum_gain = np.cumsum(gain_hist[order])
 
     return {
         "nearest_idx": nearest_idx,
@@ -573,12 +533,7 @@ def build_historical_curve(
     }
 
 
-def bootstrap_multi_arm_ci(
-    spend,
-    gain,
-    n_boot=50,
-    seed=42,
-):
+def bootstrap_multi_arm_ci(spend, gain, n_boot=50, seed=42):
     rng = np.random.default_rng(seed)
     N = spend.shape[0]
 
@@ -592,23 +547,18 @@ def bootstrap_multi_arm_ci(
         gain_b = gain[idx]
 
         curve_b = build_multi_arm_optimal_curve(spend_b, gain_b)
-        xb = curve_b["cum_spend"]
+        xb = np.maximum.accumulate(curve_b["cum_spend"])
         yb = curve_b["cum_gain"]
 
-        xb = np.maximum.accumulate(xb)
         if xb[-1] <= 0:
             ys.append(np.zeros_like(x_grid))
             continue
 
         x_target = np.clip(x_grid, xb.min(), xb.max())
-        y_interp = np.interp(x_target, xb, yb)
-        ys.append(y_interp)
+        ys.append(np.interp(x_target, xb, yb))
 
     ys = np.vstack(ys)
-    y_lo = np.percentile(ys, 2.5, axis=0)
-    y_hi = np.percentile(ys, 97.5, axis=0)
-
-    return x_grid, y_lo, y_hi
+    return x_grid, np.percentile(ys, 2.5, axis=0), np.percentile(ys, 97.5, axis=0)
 
 
 def plot_multi_arm_qini_curves(
@@ -623,13 +573,7 @@ def plot_multi_arm_qini_curves(
     plt.figure(figsize=(10, 6))
 
     for c in single_arm_curves:
-        plt.plot(
-            c["cum_spend"],
-            c["cum_gain"],
-            linestyle="--",
-            linewidth=2,
-            label=c["label"],
-        )
+        plt.plot(c["cum_spend"], c["cum_gain"], linestyle="--", linewidth=2, label=c["label"])
 
     plt.plot(
         multi_arm_curve["cum_spend"],
@@ -651,10 +595,10 @@ def plot_multi_arm_qini_curves(
             label="Observed Policy (Historical)",
         )
 
-    plt.xlabel("Cumulative Discount Spend ($)")
-    plt.ylabel("Cumulative Gain (expected $ interest)")
     ttl = title if subtitle is None else f"{title}\n{subtitle}"
     plt.title(ttl)
+    plt.xlabel("Cumulative Discount Spend ($)")
+    plt.ylabel("Cumulative Gain (expected $ interest)")
     plt.grid(True)
     plt.legend()
 
@@ -683,7 +627,7 @@ def plot_best_arm_distribution(best_idx, candidate_arms, outpath=None):
 
 
 # -------------------------
-# CLI
+# Main
 # -------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -701,14 +645,14 @@ def main():
 
     set_seed(cfg["seed"])
     device = get_device(cfg.get("device", "cpu"))
-
     os.makedirs(args.outdir, exist_ok=True)
 
-    model = build_model_from_config(cfg).to(device)
     ckpt = load_checkpoint(args.ckpt, device)
+
+    model = build_model_from_config(cfg).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
 
-    loader = make_valid_loader(cfg)
+    loader = make_valid_loader(cfg, ckpt)
     pred = predict_all(model, loader, device)
 
     # ROC
@@ -730,7 +674,7 @@ def main():
     t_min, t_max = np.quantile(pred["t"], 0.01), np.quantile(pred["t"], 0.99)
     t_grid = np.linspace(t_min, t_max, args.hetero_grid_points).astype(np.float32)
 
-    H, p_min, p_max = compute_heterogeneity_max_min(
+    H, _, _ = compute_heterogeneity_max_min(
         model=model,
         x_num=pred["x_num"],
         x_cat=pred["x_cat"],
@@ -749,7 +693,7 @@ def main():
     )
     print("Saved heterogeneity max-min plot.")
 
-    # Monotonicity scatter
+    # Monotonicity
     t_eff, d_eff = compute_local_treatment_effects(
         model=model,
         x_num=pred["x_num"],
@@ -770,7 +714,6 @@ def main():
     )
     print("Saved monotonicity scatter plot.")
 
-    # Monotonicity violations
     plot_monotonicity_violations(
         model,
         pred["x_num"],
@@ -782,28 +725,27 @@ def main():
     )
     print("Saved monotonicity plots.")
 
-    # -------------------------
-    # Multi-arm Qini-style curves
-    # -------------------------
+    # Qini-style curves
     candidate_arms = np.array([0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14], dtype=np.float32)
     arm_labels = [f"Single-Arm: Bin {i+1}" for i in range(len(candidate_arms))]
 
-    # Demo balance proxy. Replace with real balance in your project.
+    # Demo proxy only. Replace with your real balance later.
     fake_balance = (50000.0 * np.exp(0.25 * pred["x_num"][:, 0])).astype(np.float32)
 
-    scored = score_candidate_arms_with_value(
+    P_arms = score_candidate_arms_prob(
         model=model,
         x_num=pred["x_num"],
         x_cat=pred["x_cat"],
         device=device,
         candidate_arms=candidate_arms,
-        balance=fake_balance,
         batch_size=4096,
     )
 
-    P_arms = scored["P"]
-    spend = scored["spend"]
-    gain = scored["gain"]
+    spend, gain = build_demo_spend_gain_from_prob(
+        P=P_arms,
+        candidate_arms=candidate_arms,
+        balance=fake_balance,
+    )
 
     single_arm_curves = build_single_arm_curves(
         spend=spend,
